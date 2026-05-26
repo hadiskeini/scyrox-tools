@@ -11,6 +11,7 @@ Run as root (needs /dev/uhid):
 
 import logging
 import os
+import select
 import signal
 import struct
 import subprocess
@@ -27,13 +28,27 @@ CMD_BATTERY = 0x04
 # --- Virtual device (uhid) ---
 UHID_PATH = "/dev/uhid"
 UHID_EVT_SIZE = 4376
+UHID_DESTROY = 1
+UHID_GET_REPORT = 9
+UHID_GET_REPORT_REPLY = 10
 UHID_CREATE2 = 11
 UHID_INPUT2 = 12
-UHID_DESTROY = 1
+UHID_SET_REPORT = 13
+UHID_SET_REPORT_REPLY = 14
 BUS_USB = 0x03
 NAME = "Scyrox V6"
 
+# Battery report (matches report ID 2 in RD below): [report_id, level%].
+BATTERY_RID = 0x02
+
 POLL_S = 60
+
+# Persisted last-known level. We seed the kernel/UPower with this at startup so
+# the very first GET_REPORT (UPower's coldplug capacity read) returns a valid
+# value instead of an error. If UPower reads an error there it discards the
+# battery as invalid and it never shows in Settings.
+STATE_FILE = "/var/lib/scyroxd/last_level"
+SEED_DEFAULT = 50
 
 # Mouse application with X/Y/buttons (Report 1, never sent) + battery (Report 2).
 # The interactive fields are required — the kernel's hid-input layer skips
@@ -152,8 +167,44 @@ def uhid_open():
 
 
 def uhid_push_battery(fd, level):
-    data = bytes([0x02, level])
+    data = bytes([BATTERY_RID, level])
     os.write(fd, _evt(UHID_INPUT2, struct.pack("=H", len(data)) + data))
+
+
+def uhid_service(fd, level):
+    """Drain pending uhid events, answering GET_REPORT/SET_REPORT.
+
+    The kernel issues a GET_REPORT to read the battery's capacity before any
+    input report has populated it (UPower does this at session start). If the
+    daemon never replies, the kernel blocks on the request until it times out —
+    which is what stalled UPower and plymouth for ~60s at boot. We must answer
+    promptly with the current level (or an error if we don't have one yet, which
+    still returns immediately instead of hanging)."""
+    while True:
+        try:
+            buf = os.read(fd, UHID_EVT_SIZE)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            log.warning("uhid read error: %s", e)
+            return
+        if len(buf) < 4:
+            continue
+        etype = struct.unpack_from("=I", buf, 0)[0]
+        if etype == UHID_GET_REPORT:
+            # u.get_report: id (u32), rnum (u8), rtype (u8)
+            rid = struct.unpack_from("=I", buf, 4)[0]
+            if level is None:
+                # No reading yet: reply EIO so the kernel returns at once.
+                reply = struct.pack("=IHH", rid, 5, 0)  # err=EIO, size=0
+            else:
+                data = bytes([BATTERY_RID, level])
+                reply = struct.pack("=IHH", rid, 0, len(data)) + data
+            os.write(fd, _evt(UHID_GET_REPORT_REPLY, reply))
+        elif etype == UHID_SET_REPORT:
+            # u.set_report begins with id (u32); ack so the kernel doesn't wait.
+            rid = struct.unpack_from("=I", buf, 4)[0]
+            os.write(fd, _evt(UHID_SET_REPORT_REPLY, struct.pack("=IH", rid, 0)))
 
 
 def uhid_close(fd):
@@ -165,6 +216,30 @@ def uhid_close(fd):
         os.close(fd)
     except OSError:
         pass
+
+
+def load_seed():
+    """Last level persisted from a previous run, or SEED_DEFAULT if none/bad."""
+    try:
+        with open(STATE_FILE) as f:
+            v = int(f.read().strip())
+        if 0 <= v <= 100:
+            return v
+    except (OSError, ValueError):
+        pass
+    return SEED_DEFAULT
+
+
+def save_level(level):
+    """Persist the latest level so the next boot seeds an accurate value."""
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(level))
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log.warning("could not persist level: %s", e)
 
 
 def nudge_upower():
@@ -198,7 +273,11 @@ def main():
     log.info("virtual HID '%s' ready", NAME)
 
     real_fd = None
-    last_level = None
+    # Seed from the last persisted reading so UPower's coldplug GET_REPORT gets a
+    # valid capacity (a None here would reply EIO and UPower drops the battery).
+    cur_level = load_seed()
+    uhid_push_battery(uhid_fd, cur_level)
+    log.info("seeded battery=%d%% (will update on first mouse poll)", cur_level)
     nudged = False
     failures = 0
     dongle_missing_logged = False
@@ -217,15 +296,17 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    while True:
+    def poll_mouse():
+        """Run one open/query cycle. Returns seconds to wait before next poll."""
+        nonlocal real_fd, cur_level, nudged, failures, dongle_missing_logged
+
         if real_fd is None:
             hidraw = find_scyrox_hidraw()
             if not hidraw:
                 if not dongle_missing_logged:
                     log.info("Scyrox dongle not present, waiting")
                     dongle_missing_logged = True
-                time.sleep(POLL_S)
-                continue
+                return POLL_S
             try:
                 real_fd = os.open(hidraw, os.O_RDWR | os.O_NONBLOCK)
                 log.info("opened %s", hidraw)
@@ -233,8 +314,7 @@ def main():
                 failures = 0
             except OSError as e:
                 log.warning("open %s failed: %s", hidraw, e)
-                time.sleep(POLL_S)
-                continue
+                return POLL_S
 
         state = query_mouse(real_fd)
 
@@ -248,27 +328,39 @@ def main():
                     pass
                 real_fd = None
                 failures = 0
-            time.sleep(5)
-            continue
+            return 5
 
         failures = 0
 
         if state.get("online") and "level" in state:
             level = state["level"]
-            if level != last_level:
+            if level != cur_level:
                 log.info(
                     "battery=%d%% charging=%s voltage=%d mV",
                     level, state["charging"], state["voltage_mv"])
-                last_level = level
+                save_level(level)
+            cur_level = level
             uhid_push_battery(uhid_fd, level)
             if not nudged:
-                time.sleep(0.5)
                 nudge_upower()
                 nudged = True
         elif not state.get("online"):
             log.debug("mouse asleep")
 
-        time.sleep(POLL_S)
+        return POLL_S
+
+    # Event loop: service uhid (GET_REPORT/SET_REPORT) the instant the kernel
+    # asks, while polling the mouse on the POLL_S cadence in between. Blocking
+    # only in select() — never in a bare sleep — keeps the kernel from stalling
+    # on an unanswered report request.
+    next_poll = 0.0
+    while True:
+        timeout = max(0.0, next_poll - time.monotonic())
+        ready, _, _ = select.select([uhid_fd], [], [], timeout)
+        if ready:
+            uhid_service(uhid_fd, cur_level)
+            continue
+        next_poll = time.monotonic() + poll_mouse()
 
 
 if __name__ == "__main__":
