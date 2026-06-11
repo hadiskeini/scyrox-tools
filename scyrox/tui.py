@@ -38,6 +38,17 @@ TOGGLES = [
 ]
 
 
+def _parse_rgb(s):
+    """Parse 'r,g,b' (0-255 each) into a tuple, or None if malformed."""
+    parts = (s or "").split(",")
+    if len(parts) != 3:
+        return None
+    try:
+        return tuple(max(0, min(255, int(p))) for p in parts)
+    except ValueError:
+        return None
+
+
 class ScyroxTUI(App):
     CSS = """
     Screen { layout: vertical; }
@@ -86,8 +97,38 @@ class ScyroxTUI(App):
                     with Horizontal(classes="row"):
                         yield Label(label)
                         yield Switch(id=f"t_{key}")
+            with Vertical(classes="panel", id="dpi"):
+                yield Label("DPI")
+                with Horizontal(classes="row"):
+                    yield Label("Active stages (1-8)")
+                    yield Input(id="dpi_count", restrict=r"\d*")
+                with Horizontal(classes="row"):
+                    yield Label("Current stage (0-based)")
+                    yield Input(id="dpi_active", restrict=r"\d*")
+                for i in range(8):
+                    with Horizontal(classes="row"):
+                        yield Label(f"  stage {i}: dpi / color")
+                        yield Input(id=f"dpi_v{i}", restrict=r"\d*",
+                                    placeholder="dpi")
+                        yield Input(id=f"dpi_c{i}", placeholder="r,g,b")
+            with Vertical(classes="panel", id="light"):
+                yield Label("Lighting")
+                with Horizontal(classes="row"):
+                    yield Label("Mode")
+                    yield Select(
+                        [(f"{m} ({'/'.join(LIGHT_MODE_CAPS.get(m, ())) or 'off'})", m)
+                         for m in range(7)], id="light_mode", allow_blank=False)
+                with Horizontal(classes="row"):
+                    yield Label("Color (r,g,b)")
+                    yield Input(id="light_color", placeholder="r,g,b")
+                with Horizontal(classes="row"):
+                    yield Label("Speed (0-9)")
+                    yield Input(id="light_speed", restrict=r"\d*")
+                with Horizontal(classes="row"):
+                    yield Label("Brightness (0-9)")
+                    yield Input(id="light_brightness", restrict=r"\d*")
             with Vertical(classes="panel", id="readonly"):
-                yield Label("Read-only (validation pending)")
+                yield Label("Other (read-only)")
                 yield Static(id="ro_body")
         yield Static("", id="pending")
         with Horizontal(id="actions"):
@@ -128,23 +169,23 @@ class ScyroxTUI(App):
             self.query_one("#angle_tune", Input).value = str(w.angle_tune_deg)
             for _label, key, attr in TOGGLES:
                 self.query_one(f"#t_{key}", Switch).value = bool(getattr(w, attr))
-        caps = ", ".join(LIGHT_MODE_CAPS.get(w.light_mode, ())) or "none"
-
-        def _stage(i):
-            x, y = w.dpi_xy(i)
-            d = f"{x}" if x == y else f"{x}x{y}"
-            return f"    stage {i}: {d} dpi  color {w.dpi_color(i)}"
-        stages = "\n".join(_stage(i) for i in range(min(w.max_dpi_stage, 8) or 1))
+            self.query_one("#dpi_count", Input).value = str(w.max_dpi_stage)
+            self.query_one("#dpi_active", Input).value = str(w.current_dpi_stage)
+            for i in range(8):
+                x, _y = w.dpi_xy(i)
+                self.query_one(f"#dpi_v{i}", Input).value = str(x)
+                r, g, b = w.dpi_color(i)
+                self.query_one(f"#dpi_c{i}", Input).value = f"{r},{g},{b}"
+            self.query_one("#light_mode", Select).value = w.light_mode
+            lr, lg, lb = w.light_color
+            self.query_one("#light_color", Input).value = f"{lr},{lg},{lb}"
+            self.query_one("#light_speed", Input).value = str(w.light_speed)
+            self.query_one("#light_brightness", Input).value = str(w.light_brightness)
         self.query_one("#ro_body", Static).update(
-            f"DPI: {w.max_dpi_stage} stages, active #{w.current_dpi_stage}\n"
-            f"{stages}\n"
-            f"Lighting: {'on' if w.light_enabled else 'off'}, mode {w.light_mode} "
-            f"(editable: {caps}), "
-            f"color {w.light_color}, speed {w.light_speed}, "
-            f"brightness {w.light_brightness}\n"
             f"LOD raw {w.setting(OFFSETS['lod'])}, "
             f"debounce raw {w.setting(OFFSETS['debounce_time'])}, "
-            f"sleep raw {w.setting(OFFSETS['sleep_time'])}")
+            f"sleep raw {w.setting(OFFSETS['sleep_time'])}  "
+            "(raw values; unit labels live in the web UI's i18n)")
         self.update_pending()
 
     def current_image(self) -> "FlashImage":
@@ -155,19 +196,48 @@ class ScyroxTUI(App):
         fields aren't normalized into spurious writes)."""
         img = FlashImage(bytes(self.original.data))
         o = self.original
+
+        def _int(sel, default):
+            try:
+                return int(self.query_one(sel, Input).value or default)
+            except ValueError:
+                return default
+
         sel = self.query_one("#report_rate", Select).value
         if isinstance(sel, int) and sel != o.report_rate_hz:
             img.report_rate_hz = sel
-        try:
-            a = max(-30, min(30, int(self.query_one("#angle_tune", Input).value or 0)))
-            if a != o.angle_tune_deg:
-                img.angle_tune_deg = a
-        except ValueError:
-            pass
+        a = max(-30, min(30, _int("#angle_tune", o.angle_tune_deg)))
+        if a != o.angle_tune_deg:
+            img.angle_tune_deg = a
         for _label, key, attr in TOGGLES:
             v = self.query_one(f"#t_{key}", Switch).value
             if v != bool(getattr(o, attr)):
                 setattr(img, attr, v)
+
+        # DPI: stage count, active stage, per-stage value + color.
+        c = _int("#dpi_count", o.max_dpi_stage)
+        if 1 <= c <= 8 and c != o.max_dpi_stage:
+            img.set_max_dpi_stage(c)
+        act = _int("#dpi_active", o.current_dpi_stage)
+        if act != o.current_dpi_stage:
+            img.set_current_dpi_stage(act)
+        for i in range(8):
+            v = _int(f"#dpi_v{i}", 0)
+            if v and v != o.dpi_xy(i)[0]:
+                img.set_dpi_xy(i, v, v)
+            rgb = _parse_rgb(self.query_one(f"#dpi_c{i}", Input).value)
+            if rgb is not None and rgb != o.dpi_color(i):
+                img.set_dpi_color(i, rgb)
+
+        # Lighting: rewrite the whole 7-byte block if any field changed.
+        lm = self.query_one("#light_mode", Select).value
+        lm = lm if isinstance(lm, int) else o.light_mode
+        lc = _parse_rgb(self.query_one("#light_color", Input).value) or o.light_color
+        ls = max(0, min(9, _int("#light_speed", o.light_speed)))
+        lb = max(0, min(9, _int("#light_brightness", o.light_brightness)))
+        if (lm, lc, ls, lb) != (o.light_mode, o.light_color,
+                                o.light_speed, o.light_brightness):
+            img.set_light(lm, lc, ls, lb)
         return img
 
     # --- edits just trigger a recompute; values are read from the widgets ---
@@ -177,7 +247,7 @@ class ScyroxTUI(App):
     def on_switch_changed(self, e: Switch.Changed) -> None:
         self.update_pending()
 
-    def on_input_submitted(self, e: Input.Submitted) -> None:
+    def on_input_changed(self, e: Input.Changed) -> None:
         self.update_pending()
 
     def _diff(self):
@@ -210,21 +280,27 @@ class ScyroxTUI(App):
         if not changed:
             self.query_one("#status", Static).update("Nothing to apply.")
             return
-        # Only known complement-pair offsets are writable here; each changed
-        # value byte is rewritten with its complement via write_setting.
-        writable = {OFFSETS[k] for k in (
-            "report_rate", "angle_tune", *[k for _l, k, _a in TOGGLES])}
-        offsets = sorted({off for off, _o, _n in changed if off in writable})
+        # Write whatever bytes changed. current_image() built every edit through
+        # the FlashImage setters, so complements and per-entry checksums are
+        # already correct — we just push the changed byte ranges to the device.
+        offsets = sorted({off for off, _o, _n in changed})
+        runs = []
+        for off in offsets:
+            if runs and off == runs[-1][1]:
+                runs[-1][1] = off + 1
+            else:
+                runs.append([off, off + 1])
         try:
             with open(self.backup_path, "wb") as f:   # safety net before writing
                 f.write(self.original.data)
-            for off in offsets:
-                self.dev.write_setting(off, work.data[off])
+            for start, end in runs:
+                self.dev.write_flash(start, bytes(work.data[start:end]))
         except Exception as e:  # noqa: BLE001
             self.query_one("#status", Static).update(f"Write failed: {e}")
             return
         self.query_one("#status", Static).update(
-            f"Applied {len(offsets)} setting(s) (backup: {self.backup_path}). Re-reading…")
+            f"Applied {len(offsets)} byte(s) in {len(runs)} field(s) "
+            f"(backup: {self.backup_path}). Re-reading…")
         self.load_from_device()
 
 

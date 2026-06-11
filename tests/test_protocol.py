@@ -198,6 +198,35 @@ def test_device_battery_and_online():
     assert dev.battery() == {"level": 73, "charging": True, "voltage_mv": 0x0FA0}
 
 
+def test_set_dpi_xy_roundtrips_with_checksum():
+    img = FlashImage(bytes(256))
+    img.set_dpi_xy(0, 1600, 1600)
+    assert img.dpi_xy(0) == (1600, 1600)
+    img.set_dpi_xy(1, 26000, 26000)          # exercises the high bits
+    assert img.dpi_xy(1) == (26000, 26000)
+    for stage in (0, 1):
+        off = OFFSETS["dpi_value"] + stage * 4
+        assert img.data[off + 3] == img.entry_checksum(*img.data[off:off + 3])
+
+
+def test_set_light_block_checksum():
+    img = FlashImage(bytes(256))
+    img.set_light(2, (10, 20, 30), 5, 7)
+    base = OFFSETS["light"]
+    assert img.light_mode == 2 and img.light_color == (10, 20, 30)
+    assert img.light_speed == 5 and img.light_brightness == 7
+    block = img.data[base:base + 6]
+    assert img.data[base + 6] == (0x55 - (sum(block) & 0xFF)) & 0xFF
+
+
+def test_set_dpi_color_checksum():
+    img = FlashImage(bytes(256))
+    img.set_dpi_color(3, (1, 2, 3))
+    off = OFFSETS["dpi_color"] + 3 * 4
+    assert img.dpi_color(3) == (1, 2, 3)
+    assert img.data[off + 3] == img.entry_checksum(1, 2, 3)
+
+
 def test_flash_image_diff():
     a = FlashImage(bytes([0, 0, 0, 0]))
     b = FlashImage(bytes([0, 9, 0, 7]))
