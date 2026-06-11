@@ -75,13 +75,14 @@ def _text(app, selector):
 async def test_tui_loads_and_populates(tmp_path):
     app, _fake = _make_app(tmp_path)
     async with app.run_test():
-        from textual.widgets import Select, Switch
+        from textual.widgets import Select, Switch, Input
         assert app.query_one("#report_rate", Select).value == 1000
         assert app.query_one("#t_motion_sync", Switch).value is True   # from dump
         assert app.original is not None and app.dev is not None        # connected
         assert app.original.dpi_xy(0) == (1600, 1600)
         assert app._diff() == []                                       # no phantom edits
-        assert "1600" in _text(app, "#ro_body")                        # DPI rendered
+        assert app.query_one("#dpi_v0", Input).value == "1600"         # DPI editable
+        assert app.query_one("#light_color", Input).value == "255,0,255"
 
 
 async def test_tui_edit_and_apply_writes_device(tmp_path):
@@ -97,6 +98,26 @@ async def test_tui_edit_and_apply_writes_device(tmp_path):
     assert fake.flash[off] == 0                                # written to device
     assert (fake.flash[off] + fake.flash[off + 1]) & 0xFF == 0x55   # valid complement
     assert os.path.exists(tmp_path / "tui-backup.bin")         # backed up first
+
+
+async def test_tui_edit_dpi_and_light_and_apply(tmp_path):
+    app, fake = _make_app(tmp_path)
+    async with app.run_test() as pilot:
+        from textual.widgets import Input
+        app.query_one("#dpi_v0", Input).value = "3200"          # DPI 1600 -> 3200
+        app.query_one("#light_color", Input).value = "0,255,0"  # magenta -> green
+        await pilot.pause()
+        assert len(app._diff()) > 0
+        app.action_apply()
+        await pilot.pause()
+    res = FlashImage(bytes(fake.flash))
+    assert res.dpi_xy(0) == (3200, 3200)                        # structured write landed
+    assert res.light_color == (0, 255, 0)
+    # checksums the device will validate on read
+    doff = OFFSETS["dpi_value"]
+    assert res.data[doff + 3] == res.entry_checksum(*res.data[doff:doff + 3])
+    loff = OFFSETS["light"]
+    assert res.data[loff + 6] == (0x55 - (sum(res.data[loff:loff + 6]) & 0xFF)) & 0xFF
 
 
 async def test_tui_apply_with_no_changes(tmp_path):

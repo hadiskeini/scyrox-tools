@@ -244,11 +244,37 @@ class FlashImage:
         y = y_lo + (((bits >> 6) & 3) << 8)
         return (x + 1) * DPI_STEP, (y + 1) * DPI_STEP
 
+    def set_dpi_xy(self, stage: int, x: int, y: int) -> None:
+        """Write a stage's X/Y DPI (no-multiplier range; DPI = (raw+1)*STEP)."""
+        rx = max(0, min(1023, round(x / DPI_STEP) - 1))
+        ry = max(0, min(1023, round(y / DPI_STEP) - 1))
+        bits = (((rx >> 8) & 3) << 2) | (((ry >> 8) & 3) << 6)
+        self.write_entry(OFFSETS["dpi_value"] + stage * 4,
+                         rx & 0xFF, ry & 0xFF, bits)
+
+    @property
+    def max_dpi_stage_value(self) -> int:
+        return self.setting(OFFSETS["max_dpi_stage"])
+
+    def set_max_dpi_stage(self, n: int) -> None:
+        self.set_setting(OFFSETS["max_dpi_stage"], n)
+
+    def set_current_dpi_stage(self, i: int) -> None:
+        self.set_setting(OFFSETS["current_dpi"], i)
+
     def dpi_color(self, stage: int) -> tuple[int, int, int]:
         return self.color(OFFSETS["dpi_color"] + stage * 4)
 
     def set_dpi_color(self, stage: int, rgb: tuple[int, int, int]) -> None:
         self.write_entry(OFFSETS["dpi_color"] + stage * 4, *rgb)
+
+    # --- lighting (7-byte block at 160: [mode,R,G,B,speed,bright,blkcrc]) ---
+    def set_light(self, mode: int, rgb: tuple[int, int, int],
+                  speed: int, brightness: int) -> None:
+        block = bytes([mode & 0xFF, rgb[0] & 0xFF, rgb[1] & 0xFF, rgb[2] & 0xFF,
+                       speed & 0xFF, brightness & 0xFF])
+        crc = (COMPLEMENT_BASE - (sum(block) & 0xFF)) & 0xFF   # Mt over bytes 0..5
+        self.data[OFFSETS["light"]:OFFSETS["light"] + 7] = block + bytes([crc])
 
     # --- buttons ---
     def key_function(self, button: int) -> tuple[int, int]:
