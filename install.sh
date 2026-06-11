@@ -21,8 +21,18 @@ if [[ -e /etc/udev/rules.d/70-scyroxd.rules ]]; then
     udevadm control --reload-rules
 fi
 
-echo "→ /usr/local/bin/scyroxd"
-install -m 755 "$DIR/scyroxd.py" /usr/local/bin/scyroxd
+# The daemon now imports the `scyrox` package, so install the package into a
+# self-contained venv and symlink its console scripts into /usr/local/bin.
+# (NixOS users: ignore this script — use modules/scyrox in your config instead.)
+VENV=/usr/local/lib/scyrox-venv
+echo "→ installing scyrox package into $VENV"
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install --quiet --upgrade pip
+"$VENV/bin/pip" install --quiet "$DIR[all]"   # + textual (TUI) + hid (cross-platform)
+for bin in scyroxd scyrox scyrox-tui; do
+    ln -sf "$VENV/bin/$bin" "/usr/local/bin/$bin"
+    echo "→ /usr/local/bin/$bin"
+done
 
 echo "→ /etc/systemd/system/scyroxd.service"
 install -m 644 "$DIR/scyroxd.service" /etc/systemd/system/
