@@ -1,3 +1,10 @@
 .claude/
 __pycache__/
 *.pyc
+# device flash backups produced by the CLI / TUI
+*.bin
+# build / editable-install / venv artifacts
+*.egg-info/
+.venv/
+build/
+.pytest_cache/

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scyrox"
+version = "0.1.0"
+description = "Native, offline configuration for Scyrox mice (Linux/macOS) — no web driver needed"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "hadi" }]
+keywords = ["scyrox", "mouse", "hid", "webhid", "configuration"]
+
+# Pure-stdlib on Linux (uses /dev/hidraw). Extras add cross-platform + TUI.
+dependencies = []
+
+[project.optional-dependencies]
+# macOS (and a nicer Linux backend): cross-platform HID via hidapi.
+hidapi = ["hid>=1.0.6"]
+# Terminal UI.
+tui = ["textual>=0.60"]
+all = ["hid>=1.0.6", "textual>=0.60"]
+
+[project.scripts]
+scyrox = "scyrox.cli:main"
+scyrox-tui = "scyrox.tui:main"
+scyroxd = "scyrox.daemon:main"   # Linux battery daemon (needs root + /dev/uhid)
+
+[tool.setuptools]
+# scyroxd.py (the Linux battery daemon) ships separately via install.sh; the
+# importable library is the `scyrox` package.
+packages = ["scyrox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
